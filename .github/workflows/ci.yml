@@ -1,0 +1,21 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      # The document suites verify against the real binaries; without them
+      # they would skip and "OCR works" would be asserted by nobody.
+      - run: sudo apt-get update && sudo apt-get install -y poppler-utils tesseract-ocr tesseract-ocr-heb imagemagick fonts-dejavu-core
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
