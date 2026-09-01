@@ -107,6 +107,17 @@ await test("with no entry at all, the failure is the caller's decision", async (
   await assert.rejects(() => cache.forScope("a1"), /db down/);
 });
 
+await test("enabled: false turns the lookup off explicitly", async () => {
+  let calls = 0;
+  const cache = new TermsCache(async () => {
+    calls++;
+    return [{ value: "Dana Cohen", kind: "person" as const }];
+  }, { enabled: false });
+  assert.deepEqual(await cache.forScope("a1"), []);
+  assert.equal(calls, 0, "the provider was called while disabled");
+  assert.equal(cache.enabled, false, "the flag is not readable for a status surface");
+});
+
 await test("clear() drops the cache so a rename is picked up", async () => {
   let name = "Old Name";
   const cache = new TermsCache(async () => [{ value: name, kind: "person" as const }], { ttlMs: 60_000 });

@@ -1,33 +1,19 @@
 # anonymize-sdk
 
-Reversible PII pseudonymization for AI egress — text, JSON request bodies, documents and images.
-
-Your prompt goes to a model vendor. The names, identity numbers, emails and phone numbers in it don't have to. This SDK finds them, replaces each with a stable placeholder, and puts the real values back into the model's reply:
+Send prompts to AI vendors **without sending the people in them**.
 
 ```
-in:   העובד דנה כהן, ת"ז 012345678
-out:  העובד [PII:PERSON:a1b2c3], ת"ז [PII:ID:9f04d1]     → vendor
-back: "…the row for [PII:PERSON:a1b2c3]…"                ← vendor
-you:  "…the row for דנה כהן…"
+you write:    העובד דנה כהן, ת"ז 012345678
+vendor sees:  העובד [PII:PERSON:a1b2c3], ת"ז [PII:ID:9f04d1]
+vendor says:  "…the row for [PII:PERSON:a1b2c3]…"
+you get:      "…the row for דנה כהן…"
 ```
 
-It was extracted from a production on-prem AI gateway for Israeli payroll bureaus, where the constraint was hard: employee registers may never leave the building, but the AI features must keep working. Every non-obvious rule in this codebase — the OCR-whitespace email pattern, the reordered-name matching, the fail-closed image handling — exists because a real document leaked past a simpler version of it.
+The mapping back lives only in memory, in your process, for one request. The vendor never sees a name, an ID, an email or a phone number — and your app never notices the difference, because the reply comes back re-hydrated.
 
-## Why reversible, not redaction
+Works on **text**, **whole JSON request bodies**, **streamed responses**, **PDFs** (read locally, only text leaves) and **screenshots** (identifying words painted over, picture forwarded).
 
-Redaction is stronger and many callers cannot use it: when the model's whole job is to read a document and return the people in it, stripping the names turns the answer into a list of blanks. Pseudonymization sends structure without identity, and the mapping back exists only in the process that made it — an in-memory `Vault` that should die with the request.
-
-## What it covers
-
-| Surface | Module | How |
-|---|---|---|
-| Text | `pseudonymize` / `rehydrate` | pattern + term-list detection, single-pass replacement |
-| JSON bodies | `pseudonymizeDeep` / `rehydrateDeep` | walks any wire shape, skip-list for payload keys |
-| Streams | `StreamingRehydrator` | re-hydrates placeholders split across chunk boundaries |
-| PDFs / scans | `readDocument` | local `pdftotext`, falling back to `pdftoppm` + `tesseract` |
-| Screenshots | `redactImage` | tesseract word boxes → ImageMagick paints over identifying words |
-| Names | `TermsCache` + your `TermsProvider` | your own register is the detector no pattern can be |
-| Everything at once | `protect` | the reference pipeline, in the order that is the security property |
+Extracted from a production on-prem AI gateway for payroll bureaus, where employee data may never leave the building.
 
 ## Install
 
@@ -35,139 +21,125 @@ Redaction is stronger and many callers cannot use it: when the model's whole job
 npm install anonymize-sdk
 ```
 
-The core has **zero runtime dependencies**. The document/image modules shell out to system binaries (never through a shell — argv arrays only):
+Zero runtime dependencies. PDFs and images need system tools (optional — skip them if you only do text):
 
 ```sh
-# Debian/Ubuntu
-apt-get install poppler-utils tesseract-ocr tesseract-ocr-heb imagemagick fonts-dejavu-core
-# macOS
-brew install poppler tesseract imagemagick
+brew install poppler tesseract imagemagick                                      # macOS
+apt-get install poppler-utils tesseract-ocr imagemagick fonts-dejavu-core       # Debian/Ubuntu
 ```
 
-`ocrAvailable()` and `redactionAvailable()` report what is present; a missing binary is a refusal, never a silent pass-through.
-
-## Quickstart — text
+## 30 seconds — text
 
 ```ts
 import { pseudonymize, rehydrate } from "anonymize-sdk";
 
-const { text, vault } = pseudonymize(
-  'העובד דנה כהן, ת"ז 012345678, dana@acme.co.il',
-  {
-    terms: [{ value: "דנה כהן", kind: "person" }],
-    key: process.env.PSEUDONYM_KEY, // stable tokens across requests; omit → per-request counters
-  },
-);
-// text: העובד [PII:PERSON:…], ת"ז [PII:ID:…], [PII:EMAIL:…]
+const { text, vault } = pseudonymize("Contact dana@acme.co.il, id 012345678");
+// → "Contact [PII:EMAIL:1], id [PII:ID:1]"
 
-const reply = await callModel(text);
-const answer = rehydrate(reply, vault);
-vault.clear(); // the vault must not outlive the request
+const reply = await callModel(text);     // your call, any vendor
+const answer = rehydrate(reply, vault);  // real values restored
 ```
 
-## Quickstart — a whole request body
+## 60 seconds — a whole request body
+
+`protect()` takes the exact JSON you were about to send (Anthropic or OpenAI shape), makes it safe, and hands you the vault for the reply:
 
 ```ts
 import { protect, rehydrateDeep } from "anonymize-sdk";
 
-const outcome = await protect(anthropicOrOpenAIBody, {
-  terms: await termsCache.forScope(tenantId),
-  key: process.env.PSEUDONYM_KEY,
-});
+const outcome = await protect(requestBody);
+if (!outcome.ok) throw new Error(outcome.refused); // an attachment couldn't be made safe
 
-if (!outcome.ok) {
-  // "attachments-blocked": something arrived that could not be made safe
-  // locally. Refuse the request — do not forward it.
-  throw new Error(outcome.refused);
-}
-
-const response = await fetch(vendorUrl, { method: "POST", body: JSON.stringify(outcome.body) });
-const answer = rehydrateDeep(await response.json(), outcome.vault);
+const res = await fetch(vendorUrl, { method: "POST", body: JSON.stringify(outcome.body) });
+const answer = rehydrateDeep(await res.json(), outcome.vault);
 ```
 
-`protect` runs the pipeline in the order that *is* the security property:
+It also handles attachments: PDFs are read **locally** and replaced with their (pseudonymized) text; with `{ vision: true }`, screenshots are forwarded with the identifying words painted over. Anything that can't be made safe blocks the request by default — never a silent pass-through.
 
-1. **Attachments first.** PDFs are read locally (`pdftotext`, then OCR) and replaced with their text; with `vision: true`, images are redacted in place — same picture, identifying words painted over, each box labeled with its placeholder from the same vault.
-2. **Policy.** Anything that could not be made safe blocks the request (default) or is forwarded whole (`attachments: "allow"` — the stats then say so honestly).
-3. **Pseudonymize.** By now the body is only text, which the engine knows how to protect.
+## Do I need a database? No.
 
-There is no branch in which a body is approved because a later step failed.
+Out of the box, the SDK catches everything **with a shape**: IDs, emails, phones (and amounts, if you opt in). No database, no setup.
 
-## The names — your database is the detector
+What patterns can't catch is **names** — `דנה כהן` is just two words. If you want names hidden too, hand the SDK the names you know, from wherever you keep them:
 
-Patterns catch anything with a shape. A name has no shape: `דנה כהן` is two ordinary words, and any heuristic broad enough to catch it mangles the prose around it. So names are looked up, not guessed — you supply a `TermsProvider` over your own data:
+```ts
+pseudonymize(text, { terms: [{ value: "Dana Cohen", kind: "person" }] });
+```
+
+For a live lookup against your own DB, wrap it in a `TermsCache` — one async function, any database:
 
 ```ts
 import { TermsCache } from "anonymize-sdk";
 
-const termsCache = new TermsCache(async (tenantId) => {
-  const [employees, customers] = await Promise.all([
-    db.collection("employees").find({ tenantId }, { projection: { name: 1 } }).toArray(),
-    db.collection("customers").find({ tenantId }, { projection: { name: 1 } }).toArray(),
-  ]);
-  return [
-    ...employees.map((e) => ({ value: e.name, kind: "person" as const })),
-    ...customers.map((c) => ({ value: c.name, kind: "org" as const })),
-  ];
+const names = new TermsCache(async (tenantId) => {
+  const rows = await db.query("SELECT name FROM employees WHERE tenant = $1", [tenantId]);
+  return rows.map((r) => ({ value: r.name, kind: "person" as const }));
 });
+
+const outcome = await protect(body, { terms: await names.forScope(tenantId) });
 ```
 
-`TermsCache` carries the operational behaviour that took a production incident each to learn:
-
-- **TTL cache** (default 5 min) — names change slowly; a month-end burst is not four hundred identical queries.
-- **Serve stale rather than empty** on provider failure — the names in an expired entry are still names.
-- **Throw when there is nothing at all** — an enforcing caller refuses rather than sending names unprotected. There is deliberately no "off" switch: a predecessor had one, and it silently sent every name in clear while the health endpoint still reported names as hidden.
-
-Person terms also match each of their words alone (registers store `אורי לוי`; screens render `לוי , אורי`). Org terms deliberately don't — `Ltd` and `בע"מ` end half the companies in any register, and splitting them would black out the prose.
-
-Load terms per tenant, not per end-client: a prompt about one client routinely mentions another. And don't decrypt ID columns to build the list — the pattern matcher catches identity numbers wherever they appear.
-
-## Images — cover the pixels, keep the picture
+And to switch the DB lookup off explicitly:
 
 ```ts
-import { redactImage, wasRedacted, Vault, DEFAULT_IMAGE_REDACTION } from "anonymize-sdk";
-
-const vault = new Vault(key);
-const out = await redactImage(screenshotBytes, DEFAULT_IMAGE_REDACTION, {
-  terms, vault,
-});
-if (!wasRedacted(out)) refuse(out.refused); // too-large | unreadable | tools-missing | failed
+new TermsCache(provider, { enabled: false }); // always returns [], never queries
 ```
 
-- Same `detectSpans` rules as the text path, on the same term list — one rule set, so a number can't be masked in the prompt and legible in the screenshot attached to it.
-- Solid boxes by default; blur exists but is documented as recoverable for known-font digits.
-- Output is always PNG (a JPEG halo would hint at box edges).
-- Each box is labeled with its placeholder from the shared vault, so a model can answer "click the row for `[PII:PERSON:a1b2c3]`" and re-hydration restores the name.
-- **Fail-closed everywhere**: an image OCR could barely read (`minWords`) is refused, not passed as clean — "tesseract found nothing" and "there is nothing to find" look identical, and the pessimistic reading wins.
+⚠️ Disabled means names go to the vendor in clear (IDs/emails/phones are still caught). It's a constructor flag rather than an env var on purpose — a previous life of this code had an env switch, and it silently unprotected every name while the health page still said otherwise. If you disable it, show that on your status surface (`cache.enabled` is readable).
 
-Honest limits: a word tesseract did not read is a word this cannot cover; faces, signatures and handwriting are not text and are not covered.
+`TermsCache` fails **safe**, not open: results are cached (5 min), a DB outage serves the last known list, and if there's no list at all it throws so you can refuse the request instead of leaking.
 
-## Stable tokens, and the key
+## Stable tokens (optional)
 
-With a `key`, a placeholder's suffix is an HMAC-SHA256 digest of the value: the same person is the same token in every request, so traces correlate without identifying anyone. Without a key it falls back to a per-request counter — less useful, never weaker. It is **never** an unkeyed digest: a nine-digit ID space is a minute of laptop time against a published hash. Don't bake the key into source; per-deployment secrets only.
-
-## Localisation
-
-The default patterns (`DEFAULT_PATTERNS`) are tuned for Israeli payroll: ת.ז. shapes, `+972`/`05x` phones, shekel amounts, digit folding for Arabic-Indic numerals. Every one is replaceable per call:
+Pass a `key` and the same person gets the same token in **every** request — traces stay correlatable without being identifying:
 
 ```ts
-pseudonymize(text, { patterns: { id: /(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)/ } }); // e.g. US SSN
+pseudonymize(text, { key: process.env.PSEUDONYM_KEY });
 ```
 
-The OCR caveat header and tesseract `languages` are options too (`ocrCaveat`, `languages: "heb+eng"`).
+Tokens are HMAC-based: not reversible without the key. No key → simple per-request counters (never an unkeyed hash, which would be brute-forceable).
 
-## Deployment pattern (from the original gateway)
+## Not in Israel?
 
-This SDK is the engine, not the enforcement. In the system it was extracted from, the pipeline runs in a gateway container that is **the only door**: app containers sit on an internal Docker network with no route to the internet, and the gateway is the one container that can reach out. If call sites are merely *asked* to use the anonymizer, one of them eventually won't.
+The default detectors are tuned for Israeli documents (ת.ז., +972 phones, ₪). Swap any of them:
 
-## Tests
-
-```sh
-npm test        # 70 checks across 5 suites
-npm run typecheck
+```ts
+pseudonymize(text, { patterns: { id: /(?<!\d)\d{3}-\d{2}-\d{4}(?!\d)/ } }); // US SSN
 ```
 
-The image suite verifies redaction by **reading the produced PNG back through OCR** and asserting the number is gone — the only form of the claim a customer would accept. Suites that need system binaries skip loudly when they are absent.
+OCR language (`languages: "heb+eng"`) and the document caveat text are options too.
+
+---
+
+## Details, for when you need them
+
+**API surface**
+
+| You want to… | Use |
+|---|---|
+| Hide PII in a string | `pseudonymize` / `rehydrate` |
+| Hide PII in any JSON body | `pseudonymizeDeep` / `rehydrateDeep` |
+| Re-hydrate a streamed reply | `StreamingRehydrator` (handles tokens split across chunks) |
+| Read a PDF/scan locally | `readDocument` (pdftotext → tesseract fallback) |
+| Redact a screenshot | `redactImage` (word boxes → black boxes, labeled) |
+| Find spans without rewriting | `detectSpans` |
+| The whole pipeline at once | `protect` |
+| Names from your DB, cached | `TermsCache` |
+
+**Design choices that aren't obvious**
+
+- *Reversible, not redaction*: extraction flows need the model's answer to reference real people. Redaction would return a list of blanks.
+- *Placeholders are `[PII:KIND:x]`* — pure ASCII, no markdown meaning, self-describing, regex-recoverable. Models leave them alone.
+- *Single-pass replacement*: spans are collected and resolved before any rewriting, so a second pattern can never match inside a placeholder the first one wrote.
+- *Person terms match their individual words too* (registers store `אורי לוי`; screens show `לוי , אורי`). Org terms don't split — `Ltd` ends half the register.
+- *Email pattern tolerates OCR spaces* (`dana@ acme.co.il`) — a real leak from a real scanned document.
+- *Images fail closed*: an image OCR can barely read is refused, not passed as clean. Boxes, not blur, by default — blurred digits of a known font are recoverable.
+- *Redacted images stay images*, same slot, same wire shape, always PNG, with the placeholder painted into the box from the same vault as the text — so "click the row for `[PII:PERSON:x]`" re-hydrates.
+- *The vault is in-memory only, on purpose.* Persisting it would be a second copy of your register. `vault.clear()` when the request ends.
+
+**Deployment pattern**: this SDK is the engine, not the enforcement. In the gateway it came from, app containers have no route to the internet and the pipeline runs in the only container that does. If call sites are merely *asked* to anonymize, one of them eventually won't.
+
+**Tests**: `npm test` — 70+ checks. The image suite proves redaction by OCR-ing the produced PNG and asserting the number is gone. Suites needing system binaries skip loudly when absent; CI installs the real ones.
 
 ## License
 

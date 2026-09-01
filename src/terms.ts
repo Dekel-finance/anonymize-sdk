@@ -66,18 +66,33 @@ export interface TermsCacheOptions {
   ttlMs?: number;
   /** Where errors go. Default: `console.error`. */
   onError?: (scopeId: string, err: Error) => void;
+  /**
+   * Set `false` to turn the lookup off: `forScope` returns an empty list and
+   * the provider is never called. Names then go out unprotected — pattern
+   * kinds (ids, emails, phones) are still caught, identities are not.
+   *
+   * This exists as an explicit, in-code choice precisely because the
+   * dangerous version of it is an environment variable: the predecessor of
+   * this class had one, and setting it silently sent every name in clear
+   * while the health endpoint still reported names as hidden. If you disable
+   * this, say so on whatever status surface you expose.
+   */
+  enabled?: boolean;
 }
 
 export class TermsCache {
   private readonly byScope = new Map<string, CacheEntry>();
   private readonly ttlMs: number;
   private readonly onError: (scopeId: string, err: Error) => void;
+  /** Whether the lookup runs at all. Report this on your status surface. */
+  readonly enabled: boolean;
 
   constructor(
     private readonly provider: TermsProvider,
     opts: TermsCacheOptions = {},
   ) {
     this.ttlMs = opts.ttlMs ?? 5 * 60_000;
+    this.enabled = opts.enabled ?? true;
     this.onError =
       opts.onError ??
       ((scopeId, err) => console.error(`[anonymize-sdk] could not load names for ${scopeId}:`, err.message));
@@ -93,7 +108,7 @@ export class TermsCache {
    * exists to prevent.
    */
   async forScope(scopeId: string | undefined): Promise<Term[]> {
-    if (!scopeId) return [];
+    if (!this.enabled || !scopeId) return [];
     const hit = this.byScope.get(scopeId);
     if (hit && Date.now() - hit.loadedAt < this.ttlMs) return hit.terms;
 
